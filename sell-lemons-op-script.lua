@@ -1,818 +1,541 @@
---// Rayfield
-local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+--[[
+  PHANTOM // AUTH SYSTEM
+  Run with an executor (Synapse, Fluxus, etc.) — requires setclipboard.
+]]
 
-local Window = Rayfield:CreateWindow({
- Name = "Vibe Code Central / Sell Lemons",
- LoadingTitle = "Vibe Codey baby",
- LoadingSubtitle = "By Claude",
- ConfigurationSaving = {
- Enabled = false,
- },
- KeySystem = false,
-})
+local LINK = "https://bloxgen.pro/"
 
-local MainTab = Window:CreateTab("Main", 4483362458)
+local guiParent = game:GetService("CoreGui")
 
---// Services
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-
---// Find Tycoon
-local userTycoon = (function()
- for _, v in pairs(workspace:GetChildren()) do
- if v:IsA("Folder") and v.Name:match("Tycoon%d") then
- if v:FindFirstChild("Owner") and v.Owner.Value == LocalPlayer then
- return v
- end
- end
- end
-end)()
-
-if not userTycoon then
- Rayfield:Notify({
- Title = "Error",
- Content = "Tycoon not found!",
- Duration = 5,
- })
- return
-end
-
---// Variables
-local AutoBuy = false
-local AutoUpgrade = false
-local AutoFruit = false
-local AutoRebirth = false
-local AutoEvolve = false
-local AutoPowerLevel = false
-
--- live counters for the status panel (proof the autos are actually firing)
-local stats = { buys = 0, upgrades = 0, fruit = 0, rebirths = 0, evolves = 0 }
-
-local Buying = false
-
--- FASTER Auto Buy: every buyable item model has a child "Purchase" RemoteFunction
--- (e.g. ...ItemName.Purchase). We invoke it DIRECTLY instead of walking the
--- character to the button and firetouchinterest-ing it, so buying is instant and
--- works no matter where you are. The server still validates cost/availability.
-local function buyAllAffordable()
- for _, obj in ipairs(userTycoon.Purchases:GetDescendants()) do
- if obj:IsA("Model") then
- local shown = obj:GetAttribute("Shown")
- local purchased = obj:GetAttribute("Purchased")
- if shown == true and purchased ~= true then
- local purchase = obj:FindFirstChild("Purchase")
- if purchase and purchase:IsA("RemoteFunction") then
- pcall(function() purchase:InvokeServer() end)
- stats.buys = stats.buys + 1
- end
- end
- end
- end
-end
-
-task.spawn(function()
- while true do
- task.wait(0.05) -- a few sweeps per second is plenty for direct remotes
-
- if AutoBuy then
- pcall(buyAllAffordable)
- end
- end
-end)
-
--- FASTER Auto Upgrade. The old version scanned thousands of tycoon objects EVERY
--- frame and fired 100 server calls per machine per frame (huge FPS/network drag).
--- Now we cache the Upgrade remotes, refreshing only every 3s (to catch tycoon
--- rebuilds), and each machine just climbs from its last reached level upward,
--- stopping as soon as the server rejects (can't afford / maxed). Once maxed it
--- costs ~nothing. The level tracker resets on refresh so it re-climbs as cash grows.
-local upgradeRemotes = {}
-local upgradeLevel = {} -- [remote] = highest level reached this scan window
-local lastUpgradeScan = 0
-
-local function refreshUpgradeRemotes()
- upgradeRemotes = {}
- upgradeLevel = {}
- local purchases = userTycoon:FindFirstChild("Purchases")
- if not purchases then return end
- for _, obj in ipairs(purchases:GetDescendants()) do
- if obj:IsA("RemoteFunction") and obj.Name == "Upgrade" then
- upgradeRemotes[#upgradeRemotes + 1] = obj
- end
- end
-end
-
-task.spawn(function()
- while true do
- task.wait(0.25)
-
- if AutoUpgrade then
- if tick() - lastUpgradeScan > 3 then
- refreshUpgradeRemotes()
- lastUpgradeScan = tick()
- end
-
- for _, remote in ipairs(upgradeRemotes) do
- if remote.Parent then
- local lvl = (upgradeLevel[remote] or 0) + 1
- while lvl <= 100 do
- local ok, res = pcall(function() return remote:InvokeServer(lvl) end)
- if (not ok) or res == false then break end
- upgradeLevel[remote] = lvl
- stats.upgrades = stats.upgrades + 1
- lvl = lvl + 1
- end
- end
- end
- end
- end
-end)
-
---// Auto Power Level (RemoteFunction userTycoon.Remotes.UpgradePowerLevel)
--- Experimental: calls UpgradePowerLevel repeatedly; the server validates cost.
--- If the game needs an argument here we'll see it do nothing (harmless, pcall'd)
--- and can probe the exact arg like we did for WakeIncomeStream.
-local function getPowerLevelRemote()
- local remotes = userTycoon:FindFirstChild("Remotes")
- return remotes and remotes:FindFirstChild("UpgradePowerLevel")
-end
-
-task.spawn(function()
- while true do
- task.wait(0.25)
-
- if AutoPowerLevel then
- local remote = getPowerLevelRemote()
- if remote then
- pcall(function() remote:InvokeServer() end)
- end
- end
- end
-end)
-
---// Auto Rebirth — OPTIMAL (RemoteFunction userTycoon.Remotes.Rebirth:InvokeServer())
--- Reads the rebirth menu's "Rebirth to get... X investors" value and only
--- rebirths when it's worth it, so we don't waste tycoon rebuilds (which crash
--- the client if spammed). Each investor = +1% cash.
---
--- RebirthGainMultiple : rebirth when (pending investors) >= (current) * this.
--- 1.0 = the classic "only rebirth to at least DOUBLE
--- your investors" rule. Raise it (e.g. 2.0) to rebirth
--- less often for bigger jumps; lower it (0.25) for more.
--- MinPotential : never rebirth for fewer than this many investors.
-local RebirthGainMultiple = 1.0
-local MinPotential = 1
-local RebirthCooldown = 2 -- seconds to let the tycoon rebuild after each rebirth
-local RebirthTimeout = 8 -- max seconds to wait for "Rebirthed" before next
-local rebirthBusy = false
-
-local function getRebirthRemote()
- local remotes = userTycoon:FindFirstChild("Remotes")
- return remotes and remotes:FindFirstChild("Rebirth")
-end
-
-local function getRebirthedSignal()
- local remotes = userTycoon:FindFirstChild("Remotes")
- return remotes and remotes:FindFirstChild("Rebirthed")
-end
-
--- parse word/abbrev formatted numbers like "457.345 billion" or "22.4Qn"
-local NUM_SCALE = {
- thousand=1e3, million=1e6, billion=1e9, trillion=1e12, quadrillion=1e15,
- quintillion=1e18, sextillion=1e21, septillion=1e24, octillion=1e27,
- nonillion=1e30, decillion=1e33, undecillion=1e36, duodecillion=1e39,
- tredecillion=1e42, quattuordecillion=1e45, quindecillion=1e48,
- sexdecillion=1e51, septendecillion=1e54, octodecillion=1e57,
- novemdecillion=1e60, vigintillion=1e63,
- k=1e3, m=1e6, b=1e9, t=1e12, qd=1e15, qn=1e18, sx=1e21, sp=1e24,
+-- Colores
+local C = {
+	bg = Color3.fromRGB(18, 18, 20),
+	panel = Color3.fromRGB(28, 28, 32),
+	panelLight = Color3.fromRGB(34, 34, 38),
+	border = Color3.fromRGB(180, 35, 45),
+	red = Color3.fromRGB(200, 45, 55),
+	redDark = Color3.fromRGB(120, 28, 35),
+	white = Color3.fromRGB(235, 235, 240),
+	dim = Color3.fromRGB(120, 120, 130),
+	yellow = Color3.fromRGB(220, 180, 60),
+	green = Color3.fromRGB(70, 200, 100),
+	blue = Color3.fromRGB(80, 140, 220),
+	inputRed = Color3.fromRGB(220, 60, 70),
+	orange = Color3.fromRGB(220, 140, 70),
 }
-local function parseNumber(s)
- if not s then return nil end
- s = tostring(s):gsub(",", ""):lower()
- local num = s:match("[%d%.]+")
- local val = num and tonumber(num)
- if not val then return nil end
- local word = s:match("[%d%.%s]+([a-z]+)")
- if word and NUM_SCALE[word] then val = val * NUM_SCALE[word] end
- return val
+
+local function copyToClipboard(text)
+	if setclipboard then
+		setclipboard(text)
+		return true
+	end
+	if toclipboard then
+		toclipboard(text)
+		return true
+	end
+	if syn and syn.write_clipboard then
+		syn.write_clipboard(text)
+		return true
+	end
+	if clipboard and clipboard.set then
+		clipboard.set(text)
+		return true
+	end
+	return false
 end
 
--- read the InvestorsMenu values (works whether or not the menu is open)
-local function investorBody()
- local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
- local r = pg and pg:FindFirstChild("Rebirth")
- local im = r and r:FindFirstChild("InvestorsMenu")
- return im and im:FindFirstChild("Body")
+local function corner(inst, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r or 6)
+	c.Parent = inst
+	return c
 end
-local function readQuantity(frameName)
- local body = investorBody()
- local frame = body and body:FindFirstChild(frameName)
- local q = frame and frame:FindFirstChild("Quantity")
- return q and parseNumber(q.Text)
+
+local function stroke(inst, color, thickness)
+	local s = Instance.new("UIStroke")
+	s.Color = color or C.border
+	s.Thickness = thickness or 1
+	s.Parent = inst
+	return s
 end
-local function getCurrentInvestors() return readQuantity("Amount") or 0 end
-local function getPotentialInvestors() return readQuantity("Potential") end
 
-task.spawn(function()
- while true do
- task.wait(0.5)
+local function label(parent, props)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Font = Enum.Font.Code
+	l.TextColor3 = C.white
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextYAlignment = Enum.TextYAlignment.Center
+	for k, v in pairs(props) do
+		l[k] = v
+	end
+	l.Parent = parent
+	return l
+end
 
- if AutoRebirth and not rebirthBusy then
- local remote = getRebirthRemote()
- local potential = getPotentialInvestors()
- local current = getCurrentInvestors()
+local function button(parent, props)
+	local b = Instance.new("TextButton")
+	b.AutoButtonColor = true
+	b.Font = Enum.Font.Code
+	b.TextColor3 = C.white
+	b.Text = ""
+	for k, v in pairs(props) do
+		b[k] = v
+	end
+	b.Parent = parent
+	return b
+end
 
- -- optimal gate: only rebirth when the payout is worth it
- local worthIt = remote and potential
- and potential >= MinPotential
- and potential >= current * RebirthGainMultiple
+-- Eliminar GUI anterior si existe
+local old = guiParent:FindFirstChild("PhantomAuth")
+if old then
+	old:Destroy()
+end
 
- if worthIt then
- rebirthBusy = true
+local screen = Instance.new("ScreenGui")
+screen.Name = "PhantomAuth"
+screen.ResetOnSpawn = false
+screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screen.Parent = guiParent
 
- pcall(function()
- local done = false
- local signal = getRebirthedSignal()
- local conn
- if signal and signal:IsA("RemoteEvent") then
- conn = signal.OnClientEvent:Connect(function() done = true end)
- end
+local root = Instance.new("Frame")
+root.Name = "Root"
+root.AnchorPoint = Vector2.new(0.5, 0.5)
+root.Position = UDim2.new(0.5, 0, 0.5, 0)
+root.Size = UDim2.new(0, 420, 0, 520)
+root.BackgroundColor3 = C.bg
+root.BackgroundTransparency = 0.05
+root.BorderSizePixel = 0
+root.Parent = screen
+corner(root, 8)
+stroke(root, C.border, 1.5)
 
- remote:InvokeServer() -- yields until the server responds
- stats.rebirths = stats.rebirths + 1
+-- Header compartido
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 44)
+header.BackgroundTransparency = 1
+header.Parent = root
 
- local t = 0
- while not done and t < RebirthTimeout do
- task.wait(0.1)
- t = t + 0.1
- end
- if conn then conn:Disconnect() end
- end)
+label(header, {
+	Size = UDim2.new(1, -100, 1, 0),
+	Position = UDim2.new(0, 14, 0, 0),
+	Text = "◆  •  PHANTOM // AUTH SYSTEM",
+	TextSize = 13,
+})
 
- task.wait(RebirthCooldown) -- let the tycoon settle before next
- rebirthBusy = false
- end
- end
- end
+local classified = button(header, {
+	Size = UDim2.new(0, 88, 0, 22),
+	Position = UDim2.new(1, -108, 0.5, -11),
+	BackgroundColor3 = C.redDark,
+	Text = "CLASSIFIED",
+	TextSize = 11,
+})
+corner(classified, 4)
+
+local closeBtn = button(header, {
+	Size = UDim2.new(0, 18, 0, 18),
+	Position = UDim2.new(1, -26, 0.5, -9),
+	BackgroundColor3 = C.red,
+	Text = "",
+})
+corner(closeBtn, 3)
+closeBtn.MouseButton1Click:Connect(function()
+	screen:Destroy()
 end)
 
---// Auto Evolve — OPTIMAL (RemoteFunction userTycoon.Remotes.Evolve)
--- Evolution gives x10 income SPEED each, but you can only evolve once the
+local headerLine = Instance.new("Frame")
+headerLine.Size = UDim2.new(1, -24, 0, 1)
+headerLine.Position = UDim2.new(0, 12, 0, 44)
+headerLine.BackgroundColor3 = C.border
+headerLine.BorderSizePixel = 0
+headerLine.Parent = root
 
- We read EvolutionMenu.Body.Progress ("1.9%")
--- and evolve when it reaches EvolveAt%. Waits for the "Evolved" event, like rebirth.
-local EvolveAt = 100 -- % progress required before evolving (100 = full bar)
-local EvolveCooldown = 2
-local EvolveTimeout = 8
-local evolveBusy = false
+-- Pantallas
+local authScreen = Instance.new("Frame")
+authScreen.Name = "AuthScreen"
+authScreen.Size = UDim2.new(1, 0, 1, -44)
+authScreen.Position = UDim2.new(0, 0, 0, 44)
+authScreen.BackgroundTransparency = 1
+authScreen.Parent = root
 
-local function getEvolveRemote()
- local remotes = userTycoon:FindFirstChild("Remotes")
- return remotes and remotes:FindFirstChild("Evolve")
+local briefScreen = Instance.new("Frame")
+briefScreen.Name = "BriefScreen"
+briefScreen.Size = UDim2.new(1, 0, 1, -44)
+briefScreen.Position = UDim2.new(0, 0, 0, 44)
+briefScreen.BackgroundTransparency = 1
+briefScreen.Visible = false
+briefScreen.Parent = root
+
+local function showAuth()
+	authScreen.Visible = true
+	briefScreen.Visible = false
 end
-local function getEvolvedSignal()
- local remotes = userTycoon:FindFirstChild("Remotes")
- return remotes and remotes:FindFirstChild("Evolved")
-end
-local function getEvolveProgress()
- local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
- local r = pg and pg:FindFirstChild("Rebirth")
- local em = r and r:FindFirstChild("EvolutionMenu")
- local body = em and em:FindFirstChild("Body")
- local p = body and body:FindFirstChild("Progress")
- if not p then return nil end
- return tonumber(tostring(p.Text):match("[%d%.]+"))
+
+local function showBrief()
+	authScreen.Visible = false
+	briefScreen.Visible = true
 end
 
-task.spawn(function()
- while true do
- task.wait(0.5)
+-- ========== PANTALLA AUTH ==========
+local banner = Instance.new("Frame")
+banner.Size = UDim2.new(1, -24, 0, 64)
+banner.Position = UDim2.new(0, 12, 0, 10)
+banner.BackgroundColor3 = C.panel
+banner.BorderSizePixel = 0
+banner.Parent = authScreen
+corner(banner, 6)
 
- if AutoEvolve and not evolveBusy then
- local remote = getEvolveRemote()
- local progress = getEvolveProgress()
+label(banner, {
+	Size = UDim2.new(1, -16, 0, 22),
+	Position = UDim2.new(0, 12, 0, 12),
+	Text = "🛡  PHANTOM DEFENSE SYSTEM",
+	TextSize = 15,
+	Font = Enum.Font.GothamBold,
+})
 
- if remote and progress and progress >= EvolveAt then
- evolveBusy = true
- pcall(function()
- local done = false
- local signal = getEvolvedSignal()
- local conn
- if signal and signal:IsA("RemoteEvent") then
- conn = signal.OnClientEvent:Connect(function() done = true end)
- end
- remote:InvokeServer()
- stats.evolves = stats.evolves + 1
- local t = 0
- while not done and t < EvolveTimeout do
- task.wait(0.1); t = t + 0.1
- end
- if conn then conn:Disconnect() end
- end)
- task.wait(EvolveCooldown)
- evolveBusy = false
- end
- end
- end
+label(banner, {
+	Size = UDim2.new(1, -16, 0, 18),
+	Position = UDim2.new(0, 12, 0, 36),
+	Text = "Authorization Required — Clearance Level 5",
+	TextSize = 11,
+	TextColor3 = C.dim,
+})
+
+local statsRow = Instance.new("Frame")
+statsRow.Size = UDim2.new(1, -24, 0, 48)
+statsRow.Position = UDim2.new(0, 12, 0, 82)
+statsRow.BackgroundTransparency = 1
+statsRow.Parent = authScreen
+
+local statData = {
+	{ title = "THREAT LEVEL", value = "ELEVATED", color = C.yellow },
+	{ title = "ENCRYPTION", value = "AES-256", color = C.green },
+	{ title = "SESSION", value = string.format("%06X", math.random(0, 0xFFFFFF)), color = C.dim },
+}
+
+for i, s in ipairs(statData) do
+	local col = Instance.new("Frame")
+	col.Size = UDim2.new(1 / 3, -4, 1, 0)
+	col.Position = UDim2.new((i - 1) / 3, (i - 1) * 2, 0, 0)
+	col.BackgroundTransparency = 1
+	col.Parent = statsRow
+
+	label(col, {
+		Size = UDim2.new(1, 0, 0, 14),
+		Text = s.title,
+		TextSize = 9,
+		TextColor3 = C.dim,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+
+	label(col, {
+		Size = UDim2.new(1, 0, 0, 20),
+		Position = UDim2.new(0, 0, 0, 16),
+		Text = s.value,
+		TextSize = 12,
+		TextColor3 = s.color,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+end
+
+local KEY_PLACEHOLDER = "KEY_XXXX-XXXX-XXXX-XXXX"
+
+label(authScreen, {
+	Size = UDim2.new(1, 0, 0, 18),
+	Position = UDim2.new(0, 0, 0, 142),
+	Text = "— ENTER AUTHORIZATION KEY —",
+	TextSize = 11,
+	TextColor3 = C.dim,
+	TextXAlignment = Enum.TextXAlignment.Center,
+})
+
+local keyField = Instance.new("Frame")
+keyField.Size = UDim2.new(1, -24, 0, 36)
+keyField.Position = UDim2.new(0, 12, 0, 166)
+keyField.BackgroundColor3 = Color3.fromRGB(22, 22, 26)
+keyField.BorderSizePixel = 0
+keyField.Parent = authScreen
+corner(keyField, 4)
+stroke(keyField, Color3.fromRGB(45, 45, 52), 1)
+
+label(keyField, {
+	Size = UDim2.new(0, 28, 1, 0),
+	Position = UDim2.new(0, 8, 0, 0),
+	Text = ">>",
+	TextSize = 14,
+	TextColor3 = C.green,
+	TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local keyBox = Instance.new("TextBox")
+keyBox.Size = UDim2.new(1, -40, 1, 0)
+keyBox.Position = UDim2.new(0, 36, 0, 0)
+keyBox.BackgroundTransparency = 1
+keyBox.TextColor3 = Color3.fromRGB(140, 140, 150)
+keyBox.PlaceholderText = KEY_PLACEHOLDER
+keyBox.PlaceholderColor3 = Color3.fromRGB(90, 90, 100)
+keyBox.Text = ""
+keyBox.Font = Enum.Font.Code
+keyBox.TextSize = 13
+keyBox.ClearTextOnFocus = false
+keyBox.BorderSizePixel = 0
+keyBox.Parent = keyField
+
+local authBtn = button(authScreen, {
+	Size = UDim2.new(1, -24, 0, 40),
+	Position = UDim2.new(0, 12, 0, 220),
+	BackgroundColor3 = C.red,
+	Text = "  ▶  AUTHENTICATE",
+	TextSize = 14,
+	Font = Enum.Font.GothamBold,
+})
+corner(authBtn, 6)
+
+local freeKeyBtn = button(authScreen, {
+	Size = UDim2.new(1, -24, 0, 36),
+	Position = UDim2.new(0, 12, 0, 268),
+	BackgroundColor3 = C.panelLight,
+	Text = "  🔑  GET FREE KEY",
+	TextSize = 13,
+})
+corner(freeKeyBtn, 6)
+stroke(freeKeyBtn, Color3.fromRGB(50, 50, 55), 1)
+
+freeKeyBtn.MouseButton1Click:Connect(showBrief)
+
+local keyFieldStroke = keyField:FindFirstChildOfClass("UIStroke")
+local authBtnDefaultText = authBtn.Text
+local authBtnDefaultColor = authBtn.BackgroundColor3
+
+local function denyAuth(message)
+	keyBox.Text = ""
+	keyBox.PlaceholderText = message
+	keyBox.PlaceholderColor3 = C.red
+
+	authBtn.Text = "  ✕  ACCESS DENIED"
+	authBtn.BackgroundColor3 = C.redDark
+
+	if keyFieldStroke then
+		keyFieldStroke.Color = C.red
+	end
+
+	task.delay(2.5, function()
+		if not keyBox.Parent then
+			return
+		end
+		keyBox.PlaceholderText = KEY_PLACEHOLDER
+		keyBox.PlaceholderColor3 = Color3.fromRGB(90, 90, 100)
+		authBtn.Text = authBtnDefaultText
+		authBtn.BackgroundColor3 = authBtnDefaultColor
+		if keyFieldStroke then
+			keyFieldStroke.Color = Color3.fromRGB(45, 45, 52)
+		end
+	end)
+end
+
+authBtn.MouseButton1Click:Connect(function()
+	if keyBox.Text == "" then
+		denyAuth("Enter a key first")
+	else
+		-- Always deny — no valid keys
+		denyAuth("ACCESS DENIED — INVALID KEY")
+	end
 end)
 
---// Pull All Levers — the 4 colored sewer door levers (Map.Sewer.Doors*.Lever).
--- They're touch-activated (no prompt/clickdetector), so we firetouchinterest each
--- one. Also touches the sewer collectible keys (CashVine / SewerAlien) so the run
--- actually pays out. Returns how many levers it pulled.
-local function pullAllLevers()
- local char = LocalPlayer.Character
- local hrp = char and char:FindFirstChild("HumanoidRootPart")
- if not hrp then return 0 end
+-- Footer auth
+local authFooter = Instance.new("Frame")
+authFooter.Size = UDim2.new(1, -24, 0, 20)
+authFooter.Position = UDim2.new(0, 12, 1, -28)
+authFooter.BackgroundTransparency = 1
+authFooter.Parent = authScreen
 
- local map = workspace:FindFirstChild("Map")
- local sewer = map and map:FindFirstChild("Sewer")
- local root = sewer or workspace
+label(authFooter, {
+	Size = UDim2.new(0.5, 0, 1, 0),
+	Text = "PHANTOM v1.0",
+	TextSize = 10,
+	TextColor3 = C.dim,
+})
 
- local pulled = 0
- for _, o in ipairs(root:GetDescendants()) do
- if o:IsA("BasePart") and (o.Name == "Lever" or string.find(string.lower(o.Name), "lever", 1, true)) then
- pcall(function()
- firetouchinterest(hrp, o, 0)
- firetouchinterest(hrp, o, 1)
- end)
- pulled = pulled + 1
- end
- end
-
- -- touch the sewer collectible keys so the reward is actually grabbed
- if sewer then
- for _, o in ipairs(sewer:GetDescendants()) do
- if o:IsA("BasePart") and (o.Name == "VineKey" or o.Name == "UFOKey") then
- pcall(function()
- firetouchinterest(hrp, o, 0)
- firetouchinterest(hrp, o, 1)
- end)
- end
- end
- end
-
- return pulled
-end
-
---// Sewer Run — pull levers + grab keys + open door from where you are (these
--- fire fine at range), then TELEPORT only to the CashVine to harvest the reward.
-local function touchPart(hrp, part)
- pcall(function()
- firetouchinterest(hrp, part, 0)
- firetouchinterest(hrp, part, 1)
- end)
-end
-
-local function doSewerRun()
- local char = LocalPlayer.Character
- local hrp = char and char:FindFirstChild("HumanoidRootPart")
- if not hrp then return false, "no character" end
-
- local map = workspace:FindFirstChild("Map")
- local sewer = map and map:FindFirstChild("Sewer")
- if not sewer then return false, "sewer not loaded" end
-
- -- 1) pull all levers (fired in place)
- for _, o in ipairs(sewer:GetDescendants()) do
- if o:IsA("BasePart") and string.find(string.lower(o.Name), "lever", 1, true) then
- touchPart(hrp, o)
- end
- end
-
- -- 2) grab the keys (VineKey = door key, UFOKey = investor boost)
- for _, folderName in ipairs({ "CashVine", "SewerAlien" }) do
- local folder = sewer:FindFirstChild(folderName)
- if folder then
- for _, o in ipairs(folder:GetDescendants()) do
- if o:IsA("BasePart") and (o.Name == "VineKey" or o.Name == "UFOKey") then
- touchPart(hrp, o)
- end
- end
- end
- end
- task.wait(0.3)
-
- local cashVine = sewer:FindFirstChild("CashVine")
-
- -- 3) open the VineDoor (fired in place; we now hold the key)
- if cashVine then
- local vineDoor = cashVine:FindFirstChild("VineDoor")
- if vineDoor then
- for _, o in ipairs(vineDoor:GetDescendants()) do
- if o:IsA("BasePart") then touchPart(hrp, o) end
- end
- end
- end
- task.wait(0.3)
-
- -- 4) TELEPORT to the CashVine and harvest it
- if cashVine then
- local vineModel = cashVine:FindFirstChild("CashVine")
- if vineModel then
- local pivot = vineModel:GetPivot()
- pcall(function() hrp.CFrame = pivot + Vector3.new(0, 3, 0) end)
- task.wait(0.2)
- for _, o in ipairs(vineModel:GetDescendants()) do
- if o:IsA("BasePart") then touchPart(hrp, o) end
- end
- end
- end
-
- return true
-end
-
---// Teleport to the Sewer Alien — fixed coordinates
-local SEWER_ALIEN_POS = Vector3.new(-42, -41, 180)
-local function teleportToAlien()
- local char = LocalPlayer.Character
- local hrp = char and char:FindFirstChild("HumanoidRootPart")
- if not hrp then return false, "no character" end
-
- pcall(function() hrp.CFrame = CFrame.new(SEWER_ALIEN_POS) end)
- return true
-end
-
-local Trees = {}
-
-local function addTree(obj)
- if obj:IsA("Model") and obj.Name == "LemonTree" then
-
- if not table.find(Trees, obj) then
- table.insert(Trees, obj)
- end
- end
-end
-
-local function removeTree(obj)
-
- local index = table.find(Trees, obj)
-
- if index then
- table.remove(Trees, index)
- end
-end
-
--- initial scan
-for _, v in ipairs(workspace:GetDescendants()) do
- addTree(v)
-end
-
--- realtime update
-workspace.DescendantAdded:Connect(addTree)
-workspace.DescendantRemoving:Connect(removeTree)
-
-local function noCollisionTree(tree)
-
- for _, obj in ipairs(tree:GetDescendants()) do
- if obj:IsA("BasePart") then
- obj.CanCollide = false
- end
- end
-end
-
-local function teleportToTree(tree)
-
- local character = LocalPlayer.Character
- if not character then
- return false
- end
-
- local hrp = character:FindFirstChild("HumanoidRootPart")
- if not hrp then
- return false
- end
-
- local cf = tree:GetPivot()
-
- hrp.CFrame = cf + Vector3.new(0, 5, 0)
-
- return true
-end
-
-local function collectFruit(tree)
-
- noCollisionTree(tree)
-
- local success = teleportToTree(tree)
-
- if not success then
- return
- end
-
- for _, obj in ipairs(tree:GetDescendants()) do
-
- if obj:IsA("BasePart") and obj.Name == "Fruit" then
-
- obj.CanCollide = false
-
- local clickPart = obj:FindFirstChild("ClickPart")
-
- if clickPart then
-
- local detector = clickPart:FindFirstChildOfClass("ClickDetector")
-
- if detector then
-
- task.wait(0.45)
-
- pcall(function()
- fireclickdetector(detector)
- end)
- stats.fruit = stats.fruit + 1
- end
- end
- end
- end
-end
+local timeLabel = label(authFooter, {
+	Size = UDim2.new(0.5, 0, 1, 0),
+	Position = UDim2.new(0.5, 0, 0, 0),
+	Text = "◆ 00:00:00 UTC",
+	TextSize = 10,
+	TextColor3 = C.dim,
+	TextXAlignment = Enum.TextXAlignment.Right,
+})
 
 task.spawn(function()
- while true do
- task.wait(0.1)
-
- if AutoFruit then
-
- for _, tree in ipairs(Trees) do
-
- if not AutoFruit then
- break
- end
-
- if tree and tree.Parent then
-
- pcall(function()
- collectFruit(tree)
- end)
- end
- end
- end
- end
+	while screen.Parent do
+		timeLabel.Text = "◆ " .. os.date("!%H:%M:%S") .. " UTC"
+		task.wait(1)
+	end
 end)
 
+-- ========== PANTALLA BRIEFING ==========
+local briefBanner = Instance.new("Frame")
+briefBanner.Size = UDim2.new(1, -24, 0, 56)
+briefBanner.Position = UDim2.new(0, 12, 0, 8)
+briefBanner.BackgroundColor3 = C.panel
+briefBanner.BorderSizePixel = 0
+briefBanner.Parent = briefScreen
+corner(briefBanner, 6)
 
-MainTab:CreateToggle({
- Name = "Auto Buy",
- CurrentValue = false,
- Flag = "AutoBuy",
- Callback = function(Value)
- AutoBuy = Value
-
- Rayfield:Notify({
- Title = "Auto Buy",
- Content = Value and "Enabled" or "Disabled",
- Duration = 3,
- })
- end,
+label(briefBanner, {
+	Size = UDim2.new(1, -14, 0, 20),
+	Position = UDim2.new(0, 10, 0, 10),
+	Text = "📡  KEY ACQUISITION BRIEFING",
+	TextSize = 13,
+	Font = Enum.Font.GothamBold,
 })
 
-MainTab:CreateToggle({
- Name = "Auto Upgrade",
- CurrentValue = false,
- Flag = "AutoUpgrade",
- Callback = function(Value)
- AutoUpgrade = Value
-
- Rayfield:Notify({
- Title = "Auto Upgrade",
- Content = Value and "Enabled" or "Disabled",
- Duration = 3,
- })
- end,
+label(briefBanner, {
+	Size = UDim2.new(1, -14, 0, 16),
+	Position = UDim2.new(0, 10, 0, 32),
+	Text = "Follow protocol exactly as described below",
+	TextSize = 10,
+	TextColor3 = C.dim,
 })
 
-MainTab:CreateToggle({
- Name = "Auto Fruit",
- CurrentValue = false,
- Flag = "AutoFruit",
- Callback = function(Value)
- AutoFruit = Value
+local steps = {
+	{ n = "01", icon = "🖱", text = "Click [ COPY LINK ] to copy the access URL", tag = "HIGH", tagColor = C.red },
+	{ n = "02", icon = "🌐", text = "Open a web browser on your device", tag = "MED", tagColor = C.yellow },
+	{ n = "03", icon = "📋", text = "Paste link into address bar -> Execute", tag = "HIGH", tagColor = C.red },
+	{ n = "04", icon = "✅", text = "Download software for key generation", tag = "HIGH", tagColor = C.red },
+	{ n = "05", icon = "🔑", text = "Extract generated key from the software", tag = "MED", tagColor = C.yellow },
+	{ n = "06", icon = "🛡", text = "Return and submit key for authentication", tag = "LOW", tagColor = C.green },
+}
 
- Rayfield:Notify({
- Title = "Auto Fruit",
- Content = Value and "Enabled" or "Disabled",
- Duration = 3,
- })
- end,
+local stepsContainer = Instance.new("ScrollingFrame")
+stepsContainer.Size = UDim2.new(1, -24, 0, 280)
+stepsContainer.Position = UDim2.new(0, 12, 0, 72)
+stepsContainer.BackgroundTransparency = 1
+stepsContainer.BorderSizePixel = 0
+stepsContainer.ScrollBarThickness = 4
+stepsContainer.ScrollBarImageColor3 = C.redDark
+stepsContainer.CanvasSize = UDim2.new(0, 0, 0, #steps * 46)
+stepsContainer.Parent = briefScreen
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 6)
+listLayout.Parent = stepsContainer
+
+for _, step in ipairs(steps) do
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 40)
+	row.BackgroundColor3 = C.panel
+	row.BorderSizePixel = 0
+	row.Parent = stepsContainer
+	corner(row, 4)
+
+	label(row, {
+		Size = UDim2.new(0, 28, 1, 0),
+		Position = UDim2.new(0, 6, 0, 0),
+		Text = step.n,
+		TextSize = 12,
+		TextColor3 = C.red,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+
+	label(row, {
+		Size = UDim2.new(0, 22, 1, 0),
+		Position = UDim2.new(0, 32, 0, 0),
+		Text = step.icon,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+
+	label(row, {
+		Size = UDim2.new(1, -120, 1, 0),
+		Position = UDim2.new(0, 54, 0, 0),
+		Text = step.text,
+		TextSize = 10,
+		TextWrapped = true,
+		TextColor3 = C.white,
+	})
+
+	local tag = label(row, {
+		Size = UDim2.new(0, 36, 0, 16),
+		Position = UDim2.new(1, -42, 0.5, -8),
+		Text = step.tag,
+		TextSize = 9,
+		TextColor3 = step.tagColor,
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+	tag.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+	tag.BackgroundTransparency = 0.3
+	corner(tag, 3)
+end
+
+local copyBtn = button(briefScreen, {
+	Size = UDim2.new(1, -24, 0, 42),
+	Position = UDim2.new(0, 12, 0, 362),
+	BackgroundColor3 = C.redDark,
+	Text = "  📋  COPY LINK",
+	TextSize = 14,
+	Font = Enum.Font.GothamBold,
 })
+corner(copyBtn, 6)
+stroke(copyBtn, C.red, 1)
 
-MainTab:CreateToggle({
- Name = "Auto Rebirth",
- CurrentValue = false,
- Flag = "AutoRebirth",
- Callback = function(Value)
- AutoRebirth = Value
-
- if Value and not getRebirthRemote() then
- Rayfield:Notify({
- Title = "Auto Rebirth",
- Content = "Rebirth remote not found in your tycoon!",
- Duration = 5,
- })
- return
- end
-
- Rayfield:Notify({
- Title = "Auto Rebirth",
- Content = Value and "Enabled" or "Disabled",
- Duration = 3,
- })
- end,
+local returnBtn = button(briefScreen, {
+	Size = UDim2.new(1, -24, 0, 32),
+	Position = UDim2.new(0, 12, 0, 412),
+	BackgroundColor3 = C.panel,
+	Text = "←  RETURN TO AUTH SCREEN",
+	TextSize = 11,
+	TextColor3 = C.dim,
 })
+corner(returnBtn, 4)
 
-MainTab:CreateToggle({
- Name = "Auto Evolve (x10 income)",
- CurrentValue = false,
- Flag = "AutoEvolve",
- Callback = function(Value)
- AutoEvolve = Value
+returnBtn.MouseButton1Click:Connect(showAuth)
 
- if Value and not getEvolveRemote() then
- Rayfield:Notify({
- Title = "Auto Evolve",
- Content = "Evolve remote not found in your tycoon!",
- Duration = 5,
- })
- return
- end
-
- Rayfield:Notify({
- Title = "Auto Evolve",
- Content = Value and "Enabled (evolves at full progress)" or "Disabled",
- Duration = 3,
- })
- end,
-})
-
-MainTab:CreateToggle({
- Name = "Auto Power Level",
- CurrentValue = false,
- Flag = "AutoPowerLevel",
- Callback = function(Value)
- AutoPowerLevel = Value
-
- Rayfield:Notify({
- Title = "Auto Power Level",
- Content = Value and "Enabled" or "Disabled",
- Duration = 3,
- })
- end,
-})
-
-MainTab:CreateButton({
- Name = "Pull All Levers (sewer)",
- Callback = function()
- local n = pullAllLevers()
- Rayfield:Notify({
- Title = "Pull All Levers",
- Content = n > 0 and ("Pulled " .. n .. " lever(s) + grabbed sewer keys")
- or "No levers found (is the sewer loaded?)",
- Duration = 4,
- })
- end,
-})
-
-MainTab:CreateButton({
- Name = "Vine Harvest",
- Callback = function()
- Rayfield:Notify({ Title = "Vine Harvest", Content = "Running...", Duration = 2 })
- task.spawn(function()
-
- local ok, err = doSewerRun()
- Rayfield:Notify({
- Title = "Vine Harvest",
- Content = ok and "Done! Levers pulled, keys grabbed, vine harvested."
- or ("Failed: " .. tostring(err)),
- Duration = 5,
- })
- end)
- end,
-})
-
-MainTab:CreateButton({
- Name = "Teleport to Sewer Alien",
- Callback = function()
- local ok, err = teleportToAlien()
- Rayfield:Notify({
- Title = "Teleport to Sewer Alien",
- Content = ok and "Teleported to the sewer alien (UFO)" or ("Failed: " .. tostring(err)),
- Duration = 3,
- })
- end,
-})
-
-MainTab:CreateButton({
- Name = "Destroy GUI",
- Callback = function()
- Rayfield:Destroy()
- end,
-})
-
---// LIVE STATUS PANEL — proves the autos are firing (counters tick, FPS, cash).
--- Native Instance.new GUI (Delta-safe), draggable, parented to PlayerGui.
-task.spawn(function()
- local parent = LocalPlayer:FindFirstChildOfClass("PlayerGui")
- if not parent then
- local okh, hui = pcall(function() return gethui() end)
- parent = (okh and hui) or game:GetService("CoreGui")
- end
- pcall(function()
- local old = parent:FindFirstChild("AutoStatusGui")
- if old then old:Destroy() end
- end)
-
- local gui = Instance.new("ScreenGui")
- gui.Name = "AutoStatusGui"
- gui.ResetOnSpawn = false
- gui.IgnoreGuiInset = true
- gui.DisplayOrder = 9999
- gui.Parent = parent
-
- local frame = Instance.new("Frame")
- frame.Size = UDim2.new(0, 200, 0, 168)
- frame.Position = UDim2.new(0, 10, 0, 90)
- frame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
- frame.BackgroundTransparency = 0.1
- frame.BorderSizePixel = 0
- frame.Active = true
- frame.Parent = gui
- Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
-
- local title = Instance.new("TextLabel")
- title.Size = UDim2.new(1, 0, 0, 24)
- title.BackgroundColor3 = Color3.fromRGB(38, 40, 54)
- title.BorderSizePixel = 0
- title.Text = "AUTO STATUS"
- title.TextColor3 = Color3.fromRGB(120, 235, 140)
- title.Font = Enum.Font.GothamBold
- title.TextSize = 13
- title.Parent = frame
- Instance.new("UICorner", title).CornerRadius = UDim.new(0, 8)
-
- local body = Instance.new("TextLabel")
- body.Size = UDim2.new(1, -12, 1, -30)
- body.Position = UDim2.new(0, 8, 0, 28)
- body.BackgroundTransparency = 1
- body.TextXAlignment = Enum.TextXAlignment.Left
- body.TextYAlignment = Enum.TextYAlignment.Top
- body.RichText = true
- body.Text = "starting..."
- body.TextColor3 = Color3.fromRGB(235, 235, 245)
- body.Font = Enum.Font.Code
- body.TextSize = 12
- body.Parent = frame
-
- -- drag (mouse + touch)
- local UIS = game:GetService("UserInputService")
- local dragging, ds, sp
- title.InputBegan:Connect(function(i)
- if i.UserInputType == Enum.UserInputType.MouseButton1
- or i.UserInputType == Enum.UserInputType.Touch then
- dragging, ds, sp = true, i.Position, frame.Position
- i.Changed:Connect(function()
- if i.UserInputState == Enum.UserInputState.End then dragging = false end
- end)
- end
- end)
- UIS.InputChanged:Connect(function(i)
- if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
- or i.UserInputType == Enum.UserInputType.Touch) then
- local d = i.Position - ds
- frame.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
- end
- end)
-
- -- FPS counter
- local RunService = game:GetService("RunService")
- local frames, fps, fpsT = 0, 0, tick()
- RunService.RenderStepped:Connect(function()
- frames = frames + 1
- if tick() - fpsT >= 1 then fps, frames, fpsT = frames, 0, tick() end
- end)
-
- local function on(b) return b and "<font color='#7CFF7C'>ON</font>" or "<font color='#777'>off</font>" end
-
- while gui.Parent do
- local cashStr = "?"
- local ls = LocalPlayer:FindFirstChild("leaderstats")
- local c = ls and ls:FindFirstChild("Cash")
- if c then cashStr = tostring(c.Value) end
-
- body.Text = string.format(
- "FPS: %d\nCash: %s\n"
- .. "Buys: %d %s\nUpgr: %d %s\nFruit: %d %s\nReb: %d %s\nEvo: %d %s",
- fps, cashStr,
- stats.buys, on(AutoBuy),
- stats.upgrades, on(AutoUpgrade),
- stats.fruit, on(AutoFruit),
- stats.rebirths, on(AutoRebirth),
- stats.evolves, on(AutoEvolve)
- )
- task.wait(0.25)
- end
+copyBtn.MouseButton1Click:Connect(function()
+	local ok = copyToClipboard(LINK)
+	local prev = copyBtn.Text
+	if ok then
+		copyBtn.Text = "  ✓  COPIED!"
+		copyBtn.BackgroundColor3 = C.green
+	else
+		copyBtn.Text = "  !  use an executor"
+		copyBtn.BackgroundColor3 = C.yellow
+	end
+	task.delay(1.5, function()
+		if copyBtn.Parent then
+			copyBtn.Text = "  📋  COPY LINK"
+			copyBtn.BackgroundColor3 = C.redDark
+		end
+	end)
+	print("[PHANTOM] Link:", LINK, ok and "(clipboard)" or "(clipboard unavailable)")
 end)
 
-Rayfield:Notify({
- Title = "Loaded",
- Content = "Tycoon Autofarm Loaded Successfully",
- Duration = 5,
-})
+-- Drag window by header
+local dragging, dragStart, startPos
+header.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = root.Position
+	end
+end)
+
+header.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+	end
+end)
+
+header.InputChanged:Connect(function(input)
+	if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+		local delta = input.Position - dragStart
+		root.Position = UDim2.new(
+			startPos.X.Scale,
+			startPos.X.Offset + delta.X,
+			startPos.Y.Scale,
+			startPos.Y.Offset + delta.Y
+		)
+	end
+end)
+
+print("[PHANTOM] Auth UI loaded. COPY LINK ->", LINK)
